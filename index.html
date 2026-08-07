@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FaceOff!! ~ Totally Private Face Blurrinator 3000 ~</title>
+<meta name="description" content="Blur faces in your videos 100% in your browser. No uploads, no servers, no cookies, no tracking. Ever.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>😎</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ~*~*~ HEADER ~*~*~ -->
+<header class="site-header">
+  <div class="construction-banner" role="img" aria-label="Under construction banner">
+    <span class="stripes" aria-hidden="true"></span>
+    <span class="construction-text blink">🚧 UNDER CONSTRUCTION — SINCE 1997 — AND PROUD OF IT 🚧</span>
+    <span class="stripes" aria-hidden="true"></span>
+  </div>
+
+  <h1 class="rainbow-title" aria-label="FaceOff!!">
+    <span>F</span><span>a</span><span>c</span><span>e</span><span>O</span><span>f</span><span>f</span><span>!</span><span>!</span>
+  </h1>
+  <p class="tagline">☆ The Totally Private Face Blurrinator 3000 ☆</p>
+
+  <marquee behavior="scroll" direction="left" scrollamount="6" class="retro-marquee">
+    ★★★ WELCOME to my AWESOME page!!! ★★★ Blur faces in ANY video ★★★ 100% in YOUR browser ★★★ NOTHING is ever uploaded ★★★ Best viewed in 800x600 ★★★ Sign my guestbook!!! ★★★
+  </marquee>
+</header>
+
+<!-- ~*~*~ PRIVACY NOTE (always visible) ~*~*~ -->
+<aside class="privacy-box" id="privacy-note">
+  <h2>🔒 100% PRIVATE — READ ME!! 🔒</h2>
+  <p>
+    <b>No servers are used. Your video is NEVER uploaded, sent, or stored anywhere.</b>
+    All the face-finding and blurring happens right here, inside your own browser, on your own device.
+    No cookies. No tracking. No analytics. No ads. Nobody knows who you are or what you blurred.
+    When you close this page — <i>poof!</i> — nothing remains. 💨
+  </p>
+  <p class="privacy-fineprint">
+    (Even the open-source face-detection brain ships with this page itself — the site makes
+    zero requests to third parties. The only optional exception: if you sign the guestbook,
+    your note goes out via the Formspree mail service.)
+  </p>
+</aside>
+
+<main>
+
+<!-- ============ SCREEN 1: UPLOAD ============ -->
+<section id="screen-upload" class="screen panel">
+  <h2 class="panel-title">📼 Step 1: Pick a video!</h2>
+
+  <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Drop a video here or press Enter to browse">
+    <div class="drop-zone-inner">
+      <div class="floppy">💾</div>
+      <p class="drop-big">DRAG &amp; DROP your video here</p>
+      <p class="drop-small">— or —</p>
+      <button type="button" id="browse-btn" class="btn-90s btn-big">📂 Browse My Computer...</button>
+      <p class="drop-formats">MP4, MOV, WebM &amp; friends. (AVI works if your browser can play it!)</p>
+    </div>
+  </div>
+  <input type="file" id="file-input" accept="video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v,.3gp" hidden>
+
+  <div id="size-warning" class="warn-box" hidden>
+    <b>⚠️ WHOA, that's a chunky file!</b>
+    <span id="size-warning-text"></span>
+    You can still go ahead — just maybe grab a snack. 🍿
+  </div>
+
+  <div id="upload-error" class="error-box" role="alert" hidden></div>
+
+  <div id="file-ready" class="file-ready" hidden>
+    <table class="file-table">
+      <tr><td>📄 File:</td><td id="file-name"></td></tr>
+      <tr><td>⚖️ Size:</td><td id="file-size"></td></tr>
+      <tr><td>⏱️ Length:</td><td id="file-duration"></td></tr>
+    </table>
+    <button type="button" id="start-btn" class="btn-90s btn-go">😎 START BLURRIN'!! 😎</button>
+    <p class="tiny-note">Heads up: processing runs at about the speed of the video itself, right on your device.</p>
+  </div>
+
+  <p id="model-status" class="model-status">⏳ Warming up the face-finding robot…</p>
+</section>
+
+<!-- ============ SCREEN 2: PROCESSING ============ -->
+<section id="screen-processing" class="screen panel" hidden>
+  <h2 class="panel-title">🌀 Step 2: Blurrin' in progress…</h2>
+
+  <div class="canvas-frame">
+    <canvas id="work-canvas"></canvas>
+  </div>
+
+  <div class="progress-outer" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar">
+    <div class="progress-inner" id="progress-fill"></div>
+    <span class="progress-label" id="progress-label">0%</span>
+  </div>
+
+  <table class="stats-table">
+    <tr><td>😶‍🌫️ Faces blurred so far:</td><td id="stat-faces">0</td></tr>
+    <tr><td>🎞️ Time processed:</td><td id="stat-time">0:00 / 0:00</td></tr>
+  </table>
+
+  <p class="tiny-note blink">Do not close this window!! The hamsters are running as fast as they can 🐹</p>
+  <button type="button" id="cancel-btn" class="btn-90s btn-cancel">✋ CANCEL</button>
+</section>
+
+<!-- ============ SCREEN 3: DOWNLOAD ============ -->
+<section id="screen-download" class="screen panel" hidden>
+  <h2 class="panel-title">🎉 Step 3: All done!!</h2>
+
+  <div id="no-faces-note" class="warn-box" hidden>
+    <b>🤔 Hmm — no faces were detected in this video.</b>
+    Your download below is the re-encoded video <i>without</i> any blurring.
+    Faces that are tiny, sideways, or very dark can sneak past the robot. Sorry!
+  </div>
+
+  <div id="webm-note" class="warn-box" hidden>
+    <b>ℹ️ A small note:</b> your browser can't write MP4 files, so you're getting a
+    <b>WebM</b> instead (plays almost everywhere). For MP4 output, try Chrome, Edge, or Safari.
+  </div>
+
+  <div class="canvas-frame">
+    <video id="result-video" controls playsinline></video>
+  </div>
+
+  <table class="stats-table">
+    <tr><td>😶‍🌫️ Total face-frames blurred:</td><td id="final-faces">0</td></tr>
+    <tr><td>📦 Output size:</td><td id="final-size"></td></tr>
+  </table>
+
+  <p class="center">
+    <a id="download-link" class="btn-90s btn-go" download>💾 DOWNLOAD MY BLURRED VIDEO 💾</a>
+  </p>
+  <p class="center">
+    <button type="button" id="again-btn" class="btn-90s">🔁 Blur another one!</button>
+  </p>
+  <p class="tiny-note center">Remember: this file exists only on YOUR device. It was never uploaded anywhere.</p>
+</section>
+
+</main>
+
+<!-- ~*~*~ DONATION ~*~*~ -->
+<div class="donate-box">
+  <a href="https://paypal.me/dskapetis" target="_blank" rel="noopener" class="btn-90s btn-coffee">☕ Enjoyed this? Buy me a coffee ☕</a>
+</div>
+
+<!-- ~*~*~ GUESTBOOK ~*~*~ -->
+<section class="panel guestbook" id="guestbook">
+  <h2 class="panel-title">📖 ~*~ SIGN MY GUESTBOOK ~*~ 📖</h2>
+  <p class="center">Got an idea? Found a bug? Just wanna say hi?? Drop a note below!<br>
+  <span class="tiny-note">(Sent straight to my inbox via Formspree — nothing is stored on any server of mine, and there's no database at all.)</span></p>
+
+  <form id="guestbook-form" action="https://formspree.io/f/YOUR_FORM_ID" method="POST">
+    <label for="gb-name">Your name (or your coolest alias):</label>
+    <input type="text" id="gb-name" name="name" maxlength="80" placeholder="xX_CoolDude_Xx">
+
+    <label for="gb-email">Email (optional, if you want a reply):</label>
+    <input type="email" id="gb-email" name="email" maxlength="120" placeholder="you@example.com">
+
+    <label for="gb-message">Your message:</label>
+    <textarea id="gb-message" name="message" rows="4" maxlength="2000" required placeholder="This site is da bomb!!!"></textarea>
+
+    <button type="submit" class="btn-90s btn-big">✍️ SIGN IT!!</button>
+    <p id="gb-status" class="tiny-note center" role="status"></p>
+  </form>
+</section>
+
+<!-- ~*~*~ FOOTER ~*~*~ -->
+<footer class="site-footer">
+  <div class="hit-counter" title="Extremely scientific and accurate">
+    <span class="counter-label">You are visitor No.</span>
+    <span class="counter-digits" id="hit-counter">000000</span>
+    <span class="counter-fineprint">*counter is decorative — remember, we don't track anyone!</span>
+  </div>
+
+  <p class="footer-privacy">
+    🔒 No servers · No uploads · No cookies · No tracking · Your video never leaves your device ·
+    Close the page and nothing remains. 🔒
+  </p>
+
+  <p class="footer-badges" aria-hidden="true">
+    <span class="badge">Made with 🧠 &amp; 💪 HTML</span>
+    <span class="badge">Best viewed at 800×600</span>
+    <span class="badge">Netscape Now!</span>
+  </p>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
