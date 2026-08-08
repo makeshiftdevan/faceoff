@@ -211,6 +211,16 @@ body {
 }
 .file-table td:first-child, .stats-table td:first-child { background: #e6e6e6; font-weight: bold; }
 
+.coverage-row { margin: 4px 0 12px; }
+.select-90s {
+  font-family: inherit;
+  font-size: .95rem;
+  border: 3px inset var(--panel-bg);
+  background: #fff;
+  padding: 4px 6px;
+  max-width: 100%;
+}
+
 .model-status { text-align: center; font-size: .85rem; color: #333; }
 .tiny-note { font-size: .78rem; color: #444; }
 .center { text-align: center; }

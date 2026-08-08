@@ -20,7 +20,12 @@ const WARN_BYTES = 500 * 1024 * 1024;      // gentle warning above 500 MB
 const BIG_WARN_BYTES = 1024 * 1024 * 1024; // stronger wording above 1 GB
 const MAX_DIMENSION = 1920;                // cap output resolution for sanity
 const BOX_STICKY_FRAMES = 12;              // keep blurring briefly after a lost detection
-const BOX_PADDING = 0.28;                  // expand detected boxes by 28%
+
+// How much to expand the detected face box before blurring. The detector's
+// box is already generous (it includes the forehead), so "normal" only adds
+// a small margin — bigger values quickly make the blur dwarf the face.
+const COVERAGE_PADDING = { snug: 0.0, normal: 0.1, extra: 0.3 };
+let boxPadding = COVERAGE_PADDING.normal;
 
 const MIME_CANDIDATES = [
   'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
@@ -270,9 +275,9 @@ dropZone.addEventListener("drop", (e) => {
 // ------------------------------------------------------------------
 
 function blurRegion(video, box, scaleX, scaleY) {
-  // Expand the detected box a little so hairlines/chins are covered too.
-  const padW = box.width * BOX_PADDING;
-  const padH = box.height * BOX_PADDING;
+  // Expand the detected box by the chosen coverage margin.
+  const padW = box.width * boxPadding;
+  const padH = box.height * boxPadding;
   const x = (box.originX - padW / 2) * scaleX;
   const y = (box.originY - padH / 2) * scaleY;
   const w = (box.width + padW) * scaleX;
@@ -287,7 +292,7 @@ function blurRegion(video, box, scaleX, scaleY) {
   ctx.clip();
 
   if (useCanvasBlur) {
-    const radius = Math.max(12, Math.round(w / 5));
+    const radius = Math.max(10, Math.round(w / 8));
     ctx.filter = `blur(${radius}px)`;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     ctx.filter = "none";
@@ -327,6 +332,9 @@ async function startProcessing() {
   }
 
   clearUploadError();
+
+  const coverage = $("coverage-select").value;
+  boxPadding = COVERAGE_PADDING[coverage] ?? COVERAGE_PADDING.normal;
 
   // Fresh hidden <video> per run (a MediaElementSource can only ever be
   // attached to an element once).

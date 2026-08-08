@@ -75,6 +75,14 @@
       <tr><td>⚖️ Size:</td><td id="file-size"></td></tr>
       <tr><td>⏱️ Length:</td><td id="file-duration"></td></tr>
     </table>
+    <p class="coverage-row">
+      <label for="coverage-select"><b>🎛️ Blur coverage:</b></label>
+      <select id="coverage-select" class="select-90s">
+        <option value="snug">Snug (just the face)</option>
+        <option value="normal" selected>Normal (face + a little margin)</option>
+        <option value="extra">Extra cover (face + hair &amp; then some)</option>
+      </select>
+    </p>
     <button type="button" id="start-btn" class="btn-90s btn-go">😎 START BLURRIN'!! 😎</button>
     <p class="tiny-note">Heads up: processing runs at about the speed of the video itself, right on your device.</p>
   </div>
