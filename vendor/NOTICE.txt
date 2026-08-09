@@ -1,0 +1,17 @@
+Vendored third-party components (all MIT licensed):
+
+vendor/ort/
+  ONNX Runtime Web 1.27.0 — Copyright (c) Microsoft Corporation. MIT License.
+  https://www.npmjs.com/package/onnxruntime-web
+  Files: ort.wasm.bundle.min.mjs, ort-wasm-simd-threaded.mjs, ort-wasm-simd-threaded.wasm
+
+vendor/98css/
+  98.css 0.1.21 — Copyright (c) 2020 Jordan Scales. MIT License (see LICENSE).
+  https://github.com/jdan/98.css
+  Files: 98.css and the Pixelated MS Sans Serif webfonts.
+
+assets/face_detection_yunet_2026may.onnx
+  YuNet face detection model — Copyright (c) 2020 Shiqi Yu. MIT License.
+  From the OpenCV Zoo:
+  https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
+  sha256: ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0

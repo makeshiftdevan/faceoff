@@ -1,18 +1,16 @@
-/* FaceOff!! — client-side face blurring. No servers, no uploads, no tracking. */
+/* FaceOff — client-side face blurring. No servers, no uploads, no tracking. */
 
-// MediaPipe is vendored locally (see vendor/tasks-vision/NOTICE.txt), so the
-// app makes zero third-party requests — everything is served from this site.
-import {
-  FaceDetector,
-  FilesetResolver,
-} from "./vendor/tasks-vision/vision_bundle.mjs";
+// Everything is vendored locally (see vendor/NOTICE.txt) — the app makes zero
+// third-party requests. Face detection is YuNet (opencv_zoo, MIT) running on
+// ONNX Runtime Web's WASM engine.
+import * as ort from "./vendor/ort/ort.wasm.bundle.min.mjs";
 
 // ------------------------------------------------------------------
 // Config
 // ------------------------------------------------------------------
 
 // Replace with your real Formspree form id (e.g. "mzbqwxyz") to activate
-// the guestbook. Until then, submissions fall back to a mailto: link.
+// the feedback form. Until then, submissions fall back to a mailto: link.
 const FORMSPREE_ID = "YOUR_FORM_ID";
 const FALLBACK_EMAIL = "devanskapetis@gmail.com";
 
@@ -20,27 +18,20 @@ const WARN_BYTES = 500 * 1024 * 1024;      // gentle warning above 500 MB
 const BIG_WARN_BYTES = 1024 * 1024 * 1024; // stronger wording above 1 GB
 const MAX_DIMENSION = 1920;                // cap output resolution for sanity
 
-// The detector squeezes whatever it's given into a small square, so faces
-// that are small relative to the frame (anyone more than a few feet from a
-// phone camera) vanish below its resolution. To catch them, each frame gets
-// a full-frame pass plus one rotating square tile at 1-2 zoom levels; tile
-// hits are mapped back to frame coordinates and held by a small tracker
-// between revisits.
-const TILE_OVERLAP = 0.8;      // tile step as a fraction of tile size
-const TILE_LEVEL2_MIN = 640;   // add half-size tiles when the short side is at least this
-const MIN_TRACK_TTL = 15;      // frames a tracked face survives without re-detection
-const MATCH_IOU = 0.25;        // overlap needed to treat a detection as the same face
+// Detection: frames are downscaled so their long side is at most this before
+// running YuNet (dims padded up to multiples of 32, the model's max stride).
+const DETECT_MAX_SIDE = 960;
+const DETECT_SCORE = 0.6;   // minimum detection confidence
+const NMS_IOU = 0.3;        // overlap threshold for non-max suppression
+const TRACK_TTL = 12;       // frames a tracked face survives without re-detection
+const MATCH_IOU = 0.25;     // overlap needed to treat a detection as the same face
 
-// False-positive guards: a "face" covering a huge chunk of the frame is
-// almost always the detector hallucinating (a real close-up face scores
-// high, so those still pass).
-const MIN_SCORE = 0.5;
+// A "face" covering a huge chunk of the frame at modest confidence is a
+// hallucination (a real close-up face scores high, so those still pass).
 const HUGE_BOX_AREA = 0.35;
-const HUGE_BOX_MIN_SCORE = 0.75;
+const HUGE_BOX_MIN_SCORE = 0.8;
 
-// How much to expand the detected face box before blurring. The detector's
-// box is already generous (it includes the forehead), so "normal" only adds
-// a small margin — bigger values quickly make the blur dwarf the face.
+// How much to expand the detected face box before blurring.
 const COVERAGE_PADDING = { snug: 0.0, normal: 0.1, extra: 0.3 };
 let boxPadding = COVERAGE_PADDING.normal;
 
@@ -83,7 +74,7 @@ const ctx = canvas.getContext("2d");
 // State
 // ------------------------------------------------------------------
 
-let detector = null;
+let yunet = null; // ORT InferenceSession
 let detectorReady = false;
 let currentFile = null;
 let currentObjectUrl = null;
@@ -133,7 +124,7 @@ function formatTime(seconds) {
 }
 
 function showUploadError(message) {
-  uploadError.textContent = "💥 " + message;
+  uploadError.textContent = "❌ " + message;
   uploadError.hidden = false;
 }
 
@@ -158,43 +149,163 @@ function canvasFilterSupported() {
 const useCanvasBlur = canvasFilterSupported();
 
 // ------------------------------------------------------------------
-// Face detector (MediaPipe, runs as WASM in the browser)
+// Face detector: YuNet on ONNX Runtime Web (WASM, runs locally)
 // ------------------------------------------------------------------
 
 async function loadDetector() {
   try {
-    const vision = await FilesetResolver.forVisionTasks("./vendor/tasks-vision/wasm");
-    const options = (delegate) => ({
-      baseOptions: {
-        modelAssetPath: "./assets/blaze_face_short_range.tflite",
-        delegate,
-      },
-      runningMode: "IMAGE",
-      minDetectionConfidence: MIN_SCORE,
+    yunet = await ort.InferenceSession.create("./assets/face_detection_yunet_2026may.onnx", {
+      executionProviders: ["wasm"],
     });
-    try {
-      detector = await FaceDetector.createFromOptions(vision, options("GPU"));
-    } catch (gpuErr) {
-      console.warn("GPU delegate unavailable, falling back to CPU:", gpuErr);
-      detector = await FaceDetector.createFromOptions(vision, options("CPU"));
-    }
-    // Warm-up run so the first real frame doesn't pay the shader/graph
-    // compilation cost mid-video.
-    try {
-      const warm = document.createElement("canvas");
-      warm.width = 64;
-      warm.height = 64;
-      warm.getContext("2d").fillRect(0, 0, 64, 64);
-      detector.detect(warm);
-    } catch {}
+    // Warm up so the first real frame doesn't pay the compile cost.
+    const warm = document.createElement("canvas");
+    warm.width = 96;
+    warm.height = 96;
+    warm.getContext("2d").fillRect(0, 0, 96, 96);
+    await detectYuNet(warm, {});
     detectorReady = true;
-    modelStatus.textContent = "🤖 Face-finding robot is ready to go!";
+    modelStatus.textContent = "Face detector ready.";
   } catch (err) {
     console.error("Detector load failed:", err);
     modelStatus.textContent =
-      "😵 Couldn't load the face-detection engine. Try refreshing the page — " +
-      "if it keeps happening, your browser may be too old for WebAssembly.";
+      "Could not load the face detector. Refresh the page to retry.";
   }
+}
+
+// Run YuNet on a canvas. Returns boxes in the source canvas's coordinates:
+// { originX, originY, width, height, score }.
+//
+// Pre/post-processing follows OpenCV's FaceDetectorYN
+// (modules/objdetect/src/face_detect.cpp): BGR float input at native scale,
+// per-stride grids where score = sqrt(cls * obj), box center = (cell +
+// offset) * stride, size = exp(regression) * stride, then greedy IoU NMS.
+async function detectYuNet(source, scratch) {
+  const sw = source.width;
+  const sh = source.height;
+  const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(sw, sh));
+  const dw0 = Math.max(1, Math.round(sw * scale));
+  const dh0 = Math.max(1, Math.round(sh * scale));
+  const dw = Math.ceil(dw0 / 32) * 32;
+  const dh = Math.ceil(dh0 / 32) * 32;
+
+  if (!scratch.detectCanvas) scratch.detectCanvas = document.createElement("canvas");
+  const dc = scratch.detectCanvas;
+  if (dc.width !== dw || dc.height !== dh) {
+    dc.width = dw;
+    dc.height = dh;
+  }
+  const dctx = dc.getContext("2d", { willReadFrequently: true });
+  dctx.fillStyle = "#000";
+  dctx.fillRect(0, 0, dw, dh);
+  dctx.drawImage(source, 0, 0, sw, sh, 0, 0, dw0, dh0);
+
+  const rgba = dctx.getImageData(0, 0, dw, dh).data;
+  const n = dw * dh;
+  const input = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    input[i] = rgba[i * 4 + 2];         // B
+    input[n + i] = rgba[i * 4 + 1];     // G
+    input[2 * n + i] = rgba[i * 4];     // R
+  }
+  const feeds = {};
+  feeds[yunet.inputNames[0]] = new ort.Tensor("float32", input, [1, 3, dh, dw]);
+  const out = await yunet.run(feeds);
+
+  const candidates = [];
+  for (const stride of [8, 16, 32]) {
+    const cls = out["cls_" + stride].data;
+    const obj = out["obj_" + stride].data;
+    const bbox = out["bbox_" + stride].data;
+    const rows = dh / stride;
+    const cols = dw / stride;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const idx = r * cols + c;
+        const clsScore = Math.min(1, Math.max(0, cls[idx]));
+        const objScore = Math.min(1, Math.max(0, obj[idx]));
+        const score = Math.sqrt(clsScore * objScore);
+        if (score < DETECT_SCORE) continue;
+        const cx = (c + bbox[idx * 4]) * stride;
+        const cy = (r + bbox[idx * 4 + 1]) * stride;
+        const w = Math.exp(bbox[idx * 4 + 2]) * stride;
+        const h = Math.exp(bbox[idx * 4 + 3]) * stride;
+        candidates.push({
+          score,
+          originX: cx - w / 2,
+          originY: cy - h / 2,
+          width: w,
+          height: h,
+        });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const kept = [];
+  for (const box of candidates) {
+    if (kept.length >= 100) break;
+    if (kept.every((k) => iou(k, box) <= NMS_IOU)) kept.push(box);
+  }
+
+  const back = 1 / (dw0 / sw); // undo the downscale
+  return kept.map((b) => ({
+    score: b.score,
+    originX: b.originX * back,
+    originY: b.originY * back,
+    width: b.width * back,
+    height: b.height * back,
+  }));
+}
+
+async function detectFaces(s) {
+  const found = [];
+  try {
+    const dets = await detectYuNet(s.frameCanvas, s);
+    for (const box of dets) {
+      const areaFrac = (box.width * box.height) / (canvas.width * canvas.height);
+      if (areaFrac > HUGE_BOX_AREA && box.score < HUGE_BOX_MIN_SCORE) continue;
+      found.push(box);
+    }
+  } catch (err) {
+    // A single bad frame shouldn't kill the run.
+    console.warn("Detection hiccup:", err);
+  }
+  return found;
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a.originX, b.originX);
+  const y1 = Math.max(a.originY, b.originY);
+  const x2 = Math.min(a.originX + a.width, b.originX + b.width);
+  const y2 = Math.min(a.originY + a.height, b.originY + b.height);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  if (inter <= 0) return 0;
+  return inter / (a.width * a.height + b.width * b.height - inter);
+}
+
+// Merge fresh detections into tracked faces. A track keeps its face blurred
+// across brief detection dropouts and expires after TRACK_TTL processed
+// frames without a matching detection.
+function mergeTracks(s, boxes) {
+  for (const t of s.tracks) t.ttl--;
+  for (const box of boxes) {
+    let best = null;
+    let bestIou = MATCH_IOU;
+    for (const t of s.tracks) {
+      const i = iou(t.box, box);
+      if (i > bestIou) {
+        best = t;
+        bestIou = i;
+      }
+    }
+    if (best) {
+      best.box = box;
+      best.ttl = TRACK_TTL;
+    } else {
+      s.tracks.push({ box, ttl: TRACK_TTL });
+    }
+  }
+  s.tracks = s.tracks.filter((t) => t.ttl > 0);
 }
 
 // ------------------------------------------------------------------
@@ -212,17 +323,15 @@ function handleFile(file) {
     (file.type && file.type.startsWith("video/")) ||
     /\.(mp4|mov|avi|mkv|webm|m4v|3gp|mpg|mpeg|ogv)$/i.test(file.name);
   if (!looksLikeVideo) {
-    showUploadError(
-      `"${file.name}" doesn't look like a video file. Try an MP4, MOV, WebM, or similar.`
-    );
+    showUploadError(`"${file.name}" is not a video file. Use MP4, MOV, or WebM.`);
     return;
   }
 
   if (file.size > WARN_BYTES) {
     sizeWarningText.textContent =
       file.size > BIG_WARN_BYTES
-        ? ` This video is ${formatBytes(file.size)} — over 1 GB! Since everything runs on your own device, processing may be quite slow or could even fail, especially on phones.`
-        : ` This video is ${formatBytes(file.size)}. Since everything runs on your own device, processing might be slow depending on your hardware.`;
+        ? `This file is ${formatBytes(file.size)} (over 1 GB). Processing happens on this device and may be slow or fail, especially on phones. You can still continue.`
+        : `This file is ${formatBytes(file.size)}. Processing happens on this device and may be slow. You can still continue.`;
     sizeWarning.hidden = false;
   }
 
@@ -249,9 +358,7 @@ function handleFile(file) {
   probe.onerror = () => {
     currentFile = null;
     showUploadError(
-      `Your browser can't play "${file.name}" — the format or codec isn't supported here. ` +
-        "MP4 (H.264), MOV, and WebM almost always work; AVI often doesn't. " +
-        "Try converting the video to MP4 first."
+      `This browser can't play "${file.name}". Convert it to MP4 (H.264) and try again.`
     );
   };
 }
@@ -329,129 +436,17 @@ function blurRegion(s, box) {
   ctx.restore();
 }
 
-// ------------------------------------------------------------------
-// Multi-scale detection + tracking
-// ------------------------------------------------------------------
-
-// Square tile positions covering the frame, at full zoom (side = short
-// dimension) and, for HD frames, half zoom — so distant faces still show
-// up big enough for the detector's small internal input.
-function gridPositions(size, span) {
-  if (size >= span) return [0];
-  const step = Math.max(1, Math.round(size * TILE_OVERLAP));
-  const positions = [];
-  for (let p = 0; p < span - size; p += step) positions.push(p);
-  positions.push(span - size);
-  return [...new Set(positions)];
-}
-
-function computeTiles(w, h) {
-  const short = Math.min(w, h);
-  const sides = [short];
-  if (short >= TILE_LEVEL2_MIN) sides.push(Math.round(short / 2));
-  const tiles = [];
-  for (const side of sides) {
-    if (side >= Math.max(w, h)) continue; // the full-frame pass already covers this
-    for (const y of gridPositions(side, h))
-      for (const x of gridPositions(side, w))
-        tiles.push({ x, y, w: Math.min(side, w), h: Math.min(side, h) });
-  }
-  return tiles;
-}
-
-function detectInto(s, source, offsetX, offsetY, out) {
-  const result = detector.detect(source);
-  for (const d of result.detections || []) {
-    const b = d.boundingBox;
-    if (!b) continue;
-    const score = d.categories?.[0]?.score ?? 0;
-    const box = {
-      originX: b.originX + offsetX,
-      originY: b.originY + offsetY,
-      width: b.width,
-      height: b.height,
-    };
-    // Giant "faces" at modest confidence are hallucinations, not faces.
-    const areaFrac = (box.width * box.height) / (canvas.width * canvas.height);
-    if (areaFrac > HUGE_BOX_AREA && score < HUGE_BOX_MIN_SCORE) continue;
-    out.push(box);
-  }
-}
-
-// One full-frame pass every frame, plus one rotating tile (all tiles when
-// sweepAll is set, used for the very first frame).
-function detectFaces(s, sweepAll) {
-  const found = [];
-  try {
-    detectInto(s, s.frameCanvas, 0, 0, found);
-    const tiles = sweepAll
-      ? s.tiles
-      : s.tiles.length
-        ? [s.tiles[s.tileIndex++ % s.tiles.length]]
-        : [];
-    for (const tile of tiles) {
-      const tc = s.tileCanvas;
-      if (tc.width !== tile.w || tc.height !== tile.h) {
-        tc.width = tile.w;
-        tc.height = tile.h;
-      }
-      tc.getContext("2d").drawImage(s.frameCanvas, tile.x, tile.y, tile.w, tile.h, 0, 0, tile.w, tile.h);
-      detectInto(s, tc, tile.x, tile.y, found);
-    }
-  } catch (err) {
-    // A single bad frame shouldn't kill the run.
-    console.warn("Detection hiccup:", err);
-  }
-  return found;
-}
-
-function iou(a, b) {
-  const x1 = Math.max(a.originX, b.originX);
-  const y1 = Math.max(a.originY, b.originY);
-  const x2 = Math.min(a.originX + a.width, b.originX + b.width);
-  const y2 = Math.min(a.originY + a.height, b.originY + b.height);
-  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  if (inter <= 0) return 0;
-  return inter / (a.width * a.height + b.width * b.height - inter);
-}
-
-// Merge fresh detections into tracked faces. A track keeps its face blurred
-// between tile revisits and across brief detection dropouts, and expires
-// after trackTTL processed frames without a matching detection.
-function mergeTracks(s, boxes) {
-  for (const t of s.tracks) t.ttl--;
-  for (const box of boxes) {
-    let best = null;
-    let bestIou = MATCH_IOU;
-    for (const t of s.tracks) {
-      const i = iou(t.box, box);
-      if (i > bestIou) {
-        best = t;
-        bestIou = i;
-      }
-    }
-    if (best) {
-      best.box = box;
-      best.ttl = s.trackTTL;
-    } else {
-      s.tracks.push({ box, ttl: s.trackTTL });
-    }
-  }
-  s.tracks = s.tracks.filter((t) => t.ttl > 0);
-}
-
 async function startProcessing() {
   if (!currentFile || !currentObjectUrl) return;
   if (!detectorReady) {
-    showUploadError("The face-detection robot isn't ready yet — give it a second and try again.");
+    showUploadError("The face detector is still loading. Try again in a moment.");
     return;
   }
 
   const mimeType = pickMimeType();
   if (!mimeType) {
     showUploadError(
-      "Your browser doesn't support in-browser video recording (MediaRecorder). " +
-        "Try a recent version of Chrome, Edge, Firefox, or Safari."
+      "This browser can't record video (MediaRecorder missing). Use a recent Chrome, Edge, Firefox, or Safari."
     );
     return;
   }
@@ -474,15 +469,11 @@ async function startProcessing() {
     active: true,
     faceFrames: 0,
     tracks: [],
-    tiles: [],
-    tileIndex: 0,
-    trackTTL: MIN_TRACK_TTL,
     chunks: [],
     recorder: null,
     audioCtx: null,
     mimeType,
     frameCanvas: document.createElement("canvas"),
-    tileCanvas: document.createElement("canvas"),
     tinyCanvas: document.createElement("canvas"),
   };
   const s = session;
@@ -509,20 +500,16 @@ async function startProcessing() {
     s.frameCanvas.width = canvas.width;
     s.frameCanvas.height = canvas.height;
     s.frameCtx = s.frameCanvas.getContext("2d");
-    s.tiles = computeTiles(canvas.width, canvas.height);
-    // A track must comfortably outlive one full tile rotation.
-    s.trackTTL = Math.max(MIN_TRACK_TTL, (s.tiles.length + 1) * 2 + 4);
 
-    // Process the first frame (detect + blur, sweeping every tile) BEFORE
-    // recording starts, so not even one unblurred frame can slip into the
-    // output.
+    // Process the first frame (detect + blur) BEFORE recording starts, so
+    // not even one unblurred frame can slip into the output.
     if (video.readyState < 2) {
       await new Promise((resolve) => {
         video.oncanplay = resolve;
         setTimeout(resolve, 3000);
       });
     }
-    processFrame(s, true);
+    await processFrame(s);
 
     // --- audio: route the element's sound into the recording (not speakers)
     const stream = canvas.captureStream(30);
@@ -555,10 +542,10 @@ async function startProcessing() {
     s.recorder.start(1000);
     await video.play();
 
-    // --- per-frame loop
-    const onFrame = () => {
+    // --- per-frame loop (detection is async; never overlap runs)
+    const onFrame = async () => {
       if (!s.active) return;
-      processFrame(s);
+      await processFrame(s);
       scheduleFrame();
     };
     const scheduleFrame = () => {
@@ -589,15 +576,16 @@ async function startProcessing() {
   }
 }
 
-function processFrame(s, sweepAll = false) {
+async function processFrame(s) {
   const video = s.video;
 
   // 1. snapshot a clean frame at output size — detection and blur both read
   // from this, so boxes are already in canvas coordinates
   s.frameCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // 2. detect (full frame + tiles) and fold into tracked faces
-  const found = detectFaces(s, sweepAll);
+  // 2. detect and fold into tracked faces
+  const found = await detectFaces(s);
+  if (!s.active && s.recorder) return; // cancelled mid-inference
   mergeTracks(s, found);
   s.faceFrames += found.length;
 
@@ -656,8 +644,8 @@ function failProcessing(err) {
   }
   showScreen("upload");
   showUploadError(
-    (err && err.message ? err.message + " " : "Something went wrong while processing. ") +
-      "No harm done — nothing left your device. Try a different file or a smaller video."
+    (err && err.message ? err.message + " " : "Processing failed. ") +
+      "Nothing left this device. Try a different or smaller video."
   );
 }
 
@@ -694,7 +682,7 @@ againBtn.addEventListener("click", () => {
 });
 
 // ------------------------------------------------------------------
-// Guestbook (Formspree — no storage anywhere, just an email)
+// Feedback form (Formspree — nothing stored on any server of ours)
 // ------------------------------------------------------------------
 
 const gbForm = $("guestbook-form");
@@ -708,16 +696,16 @@ gbForm.addEventListener("submit", async (e) => {
 
   if (FORMSPREE_ID === "YOUR_FORM_ID") {
     // Formspree not configured yet — fall back to the visitor's mail app.
-    const subject = encodeURIComponent("FaceOff!! guestbook entry");
+    const subject = encodeURIComponent("FaceOff feedback");
     const body = encodeURIComponent(
       `Name: ${data.get("name") || "(anonymous)"}\nEmail: ${data.get("email") || "(none)"}\n\n${data.get("message")}`
     );
     window.location.href = `mailto:${FALLBACK_EMAIL}?subject=${subject}&body=${body}`;
-    gbStatus.textContent = "📬 Opening your email app to send your note the old-fashioned way…";
+    gbStatus.textContent = "Opening your email app…";
     return;
   }
 
-  gbStatus.textContent = "📨 Sending…";
+  gbStatus.textContent = "Sending…";
   try {
     const res = await fetch(gbForm.action, {
       method: "POST",
@@ -726,25 +714,14 @@ gbForm.addEventListener("submit", async (e) => {
     });
     if (res.ok) {
       gbForm.reset();
-      gbStatus.textContent = "🌟 Thanks!! Your note is on its way. You RULE. 🌟";
+      gbStatus.textContent = "Sent. Thank you.";
     } else {
-      gbStatus.textContent = "😖 Sending failed — please try again in a bit!";
+      gbStatus.textContent = "Sending failed. Try again later.";
     }
   } catch {
-    gbStatus.textContent = "😖 Couldn't reach the mail service — check your connection and try again!";
+    gbStatus.textContent = "No connection. Try again later.";
   }
 });
-
-// ------------------------------------------------------------------
-// Decorative hit counter — computed locally from the date, no storage,
-// no cookies, no tracking of any kind. Pure 1997 vibes.
-// ------------------------------------------------------------------
-
-(function fakeHitCounter() {
-  const daysSince1997 = Math.floor((Date.now() - Date.UTC(1997, 0, 1)) / 86400000);
-  const count = 31337 + daysSince1997 * 13 + new Date().getHours();
-  $("hit-counter").textContent = String(count).padStart(6, "0");
-})();
 
 // ------------------------------------------------------------------
 // Boot

@@ -1,6 +1,0 @@
-Vendored from the @mediapipe/tasks-vision npm package, version 0.10.14 (Apache-2.0, Copyright Google LLC).
-https://www.npmjs.com/package/@mediapipe/tasks-vision
-
-assets/blaze_face_short_range.tflite comes from:
-https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite
-(Apache-2.0, Copyright Google LLC)

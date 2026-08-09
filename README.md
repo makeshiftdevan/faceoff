@@ -1,44 +1,39 @@
-# FaceOff!! 😎 — The Totally Private Face Blurrinator 3000
+# FaceOff — Face Blur
 
 A single-page web app that blurs faces in videos **entirely in your browser**.
 No servers, no uploads, no cookies, no tracking — your video never leaves your
-device. Wrapped in a loving tribute to the 1997 web: tiled teal backgrounds,
-blinking "under construction" banners, a hit counter, and Comic Sans as far as
-the eye can see.
+device. Styled as a Windows 95 program: one wizard window, three steps, no
+clutter.
 
 ## How it works
 
-1. **Upload** — drag & drop or pick a video (MP4, MOV, WebM, etc.). Files over
-   500 MB get a gentle "this might be slow" warning (over 1 GB, a slightly
-   sterner one), but nothing is ever blocked.
-2. **Processing** — the video plays into a hidden `<video>` element while
-   [MediaPipe Face Detection](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)
-   (WASM, running locally) finds faces frame by frame. Because the detector
-   internally shrinks its input to a small square, small/distant faces would
-   vanish on a full-frame pass — so every frame also gets one rotating square
-   tile crop (at one or two zoom levels, depending on resolution), with hits
-   mapped back to frame coordinates. A tiny IoU tracker holds each face
-   between tile revisits and across brief dropouts. Detections below 0.5
-   confidence are ignored, and implausibly huge boxes (over a third of the
-   frame at modest confidence) are rejected as hallucinations. Each face gets
-   an elliptical blur sized by the "blur coverage" setting (pixelation
-   fallback on browsers without canvas filters), and the blurred canvas +
-   original audio are re-encoded live via `MediaRecorder`. A chunky retro
-   progress bar shows live progress, along with a live preview.
-3. **Download** — you get an MP4 (Chrome, Edge, Safari) or WebM (Firefox,
-   which can't write MP4 — the app tells you when that happens), named
-   `<original>-blurred.mp4`.
-
-Honest limitation: very small background faces (a distant crowd) can still
-slip past the detector, and a face entering the frame far from the camera may
-take a few tenths of a second to be picked up by the tile rotation. Skim the
-output before sharing anything sensitive.
+1. **Choose a video** — drag & drop or browse (MP4, MOV, WebM, etc.). Files
+   over 500 MB get a non-blocking "this might be slow" warning (sterner over
+   1 GB).
+2. **Blurring** — the video plays into a hidden `<video>` element while
+   [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
+   (a WIDER-Face-trained detector that handles faces from roughly 10px up)
+   runs locally on [ONNX Runtime Web](https://onnxruntime.ai/)'s WASM engine.
+   Each frame is downscaled to at most 960px on its long side, run through the
+   model (pre/post-processing ported from OpenCV's `FaceDetectorYN`: per-stride
+   grids, score = √(cls·obj), IoU NMS), and detections below 0.6 confidence or
+   implausibly huge at modest confidence are discarded. A small IoU tracker
+   carries each face across brief detection dropouts. Faces get an elliptical
+   blur sized by the "Blur size" setting (pixelation fallback on browsers
+   without canvas filters), and the blurred canvas + original audio are
+   re-encoded live via `MediaRecorder`, with a live preview and progress bar.
+3. **Done** — download an MP4 (Chrome, Edge, Safari) or WebM (Firefox, which
+   can't write MP4 — the app says so), named `<original>-blurred.mp4`.
 
 Everything is static — no build step, no dependencies to install. The
-MediaPipe library, its WASM runtime, and the face model are all **vendored
-into this repo** (`vendor/tasks-vision/`, `assets/`), so the site makes zero
-requests to third parties. The only optional exception is a guestbook
-submission, which goes out via Formspree.
+detector, its WASM runtime, the model, and the UI stylesheet are all
+**vendored into this repo** (`vendor/`, `assets/` — see `vendor/NOTICE.txt`),
+so the site makes zero requests to third parties. The only optional exception
+is a feedback submission, which goes out via Formspree.
+
+Honest limitation: tiny or heavily-shadowed background faces can still be
+missed, and a face entering the frame may take a beat to be picked up. Review
+the output before sharing anything sensitive.
 
 ## Running it
 
@@ -53,11 +48,10 @@ Or just enable **GitHub Pages** on this repo — it's a static site.
 
 ## Setup you'll want to do
 
-- **Guestbook**: create a free form at [formspree.io](https://formspree.io),
+- **Feedback form**: create a free form at [formspree.io](https://formspree.io),
   then replace `YOUR_FORM_ID` at the top of `app.js` with your form id. Until
-  then, guestbook submissions fall back to opening the visitor's email app
-  (`mailto:`) instead — nothing breaks.
-- **Donation button**: already wired to <https://paypal.me/dskapetis>.
+  then, submissions fall back to opening the visitor's email app (`mailto:`).
+- **Donation link**: already wired to <https://paypal.me/dskapetis>.
 
 ## Browser support
 
@@ -68,7 +62,8 @@ Or just enable **GitHub Pages** on this repo — it's a static site.
 | Audio preserved | ✅ | ✅ | ✅ |
 
 Works on desktop and mobile. Processing runs at roughly the playback speed of
-the video, on the user's own hardware.
+the video, on the user's own hardware; slower devices produce a choppier (but
+never unblurred) result.
 
 ## Privacy
 
@@ -76,7 +71,6 @@ the video, on the user's own hardware.
   face-detection engine is served from the site itself (no CDNs).
 - Video data is processed with the Canvas/WebAudio/MediaRecorder APIs and
   never transmitted anywhere.
-- No cookies, no localStorage, no analytics, no ad networks. The "hit counter"
-  is decorative and computed from the date.
-- Guestbook entries go straight through Formspree to email; nothing is stored
-  by this site.
+- No cookies, no storage, no analytics, no ad networks.
+- Feedback goes straight through Formspree to email; nothing is stored by
+  this site.
