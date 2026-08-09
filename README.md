@@ -13,17 +13,26 @@ the eye can see.
    sterner one), but nothing is ever blocked.
 2. **Processing** — the video plays into a hidden `<video>` element while
    [MediaPipe Face Detection](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)
-   (WASM, running locally) finds faces frame by frame. Each face gets an
-   elliptical blur (pixelation fallback on browsers without canvas filters),
-   and the blurred canvas + original audio are re-encoded live via
-   `MediaRecorder`. A chunky retro progress bar shows live progress, along with
-   a live preview of the blurring.
+   (WASM, running locally) finds faces frame by frame. Because the detector
+   internally shrinks its input to a small square, small/distant faces would
+   vanish on a full-frame pass — so every frame also gets one rotating square
+   tile crop (at one or two zoom levels, depending on resolution), with hits
+   mapped back to frame coordinates. A tiny IoU tracker holds each face
+   between tile revisits and across brief dropouts. Detections below 0.5
+   confidence are ignored, and implausibly huge boxes (over a third of the
+   frame at modest confidence) are rejected as hallucinations. Each face gets
+   an elliptical blur sized by the "blur coverage" setting (pixelation
+   fallback on browsers without canvas filters), and the blurred canvas +
+   original audio are re-encoded live via `MediaRecorder`. A chunky retro
+   progress bar shows live progress, along with a live preview.
 3. **Download** — you get an MP4 (Chrome, Edge, Safari) or WebM (Firefox,
    which can't write MP4 — the app tells you when that happens), named
    `<original>-blurred.mp4`.
 
-Detection dropouts are smoothed over: the last known face boxes stay blurred
-for a few extra frames so quick head turns don't flash unblurred.
+Honest limitation: very small background faces (a distant crowd) can still
+slip past the detector, and a face entering the frame far from the camera may
+take a few tenths of a second to be picked up by the tile rotation. Skim the
+output before sharing anything sensitive.
 
 Everything is static — no build step, no dependencies to install. The
 MediaPipe library, its WASM runtime, and the face model are all **vendored
