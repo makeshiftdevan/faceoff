@@ -14,14 +14,19 @@ clutter.
    [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
    (a WIDER-Face-trained detector that handles faces from roughly 10px up)
    runs locally on [ONNX Runtime Web](https://onnxruntime.ai/)'s WASM engine.
-   Each frame is downscaled to at most 960px on its long side, run through the
-   model (pre/post-processing ported from OpenCV's `FaceDetectorYN`: per-stride
-   grids, score = √(cls·obj), IoU NMS), and detections below 0.6 confidence or
-   implausibly huge at modest confidence are discarded. A small IoU tracker
-   carries each face across brief detection dropouts. Faces get an elliptical
+   Rendering and detection are decoupled: every video frame is drawn to the
+   recording at full rate, while detection runs in parallel at an adaptive
+   resolution (640–1280px long side, stepped to fit the device's inference
+   speed). Detections (pre/post-processing ported from OpenCV's
+   `FaceDetectorYN`: per-stride grids, score = √(cls·obj), IoU NMS, 0.5
+   confidence floor, implausibly-huge-box rejection) feed a tracker that
+   measures each face's velocity and extrapolates its blur position between
+   detector passes. The opening frame gets multiple passes before recording
+   starts, since it doubles as the video's poster. Faces get an elliptical
    blur sized by the "Blur size" setting (pixelation fallback on browsers
    without canvas filters), and the blurred canvas + original audio are
-   re-encoded live via `MediaRecorder`, with a live preview and progress bar.
+   re-encoded live via `MediaRecorder` at 12 Mbps, with live preview and
+   progress.
 3. **Done** — download an MP4 (Chrome, Edge, Safari) or WebM (Firefox, which
    can't write MP4 — the app says so), named `<original>-blurred.mp4`.
 

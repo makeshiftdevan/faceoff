@@ -18,10 +18,15 @@ const WARN_BYTES = 500 * 1024 * 1024;      // gentle warning above 500 MB
 const BIG_WARN_BYTES = 1024 * 1024 * 1024; // stronger wording above 1 GB
 const MAX_DIMENSION = 1920;                // cap output resolution for sanity
 
-// Detection: frames are downscaled so their long side is at most this before
-// running YuNet (dims padded up to multiples of 32, the model's max stride).
-const DETECT_MAX_SIDE = 960;
-const DETECT_SCORE = 0.6;   // minimum detection confidence
+// Detection: frames are downscaled so their long side matches the current
+// rung of this ladder before running YuNet (dims padded up to multiples of
+// 32, the model's max stride). The loop steps down when inference is too
+// slow for the device and back up when there's headroom — higher resolution
+// means smaller faces get caught.
+const DETECT_SIDES = [1280, 960, 768, 640];
+const DETECT_SLOW_MS = 400; // step resolution down above this per-pass time
+const DETECT_FAST_MS = 150; // step back up below this
+const DETECT_SCORE = 0.5;   // minimum detection confidence (recall-first)
 const NMS_IOU = 0.3;        // overlap threshold for non-max suppression
 const MATCH_IOU = 0.25;     // overlap needed to treat a detection as the same face
 
@@ -169,7 +174,7 @@ async function loadDetector() {
     warm.width = 96;
     warm.height = 96;
     warm.getContext("2d").fillRect(0, 0, 96, 96);
-    await detectYuNet(warm, {});
+    await detectYuNet(warm, {}, 96);
     detectorReady = true;
     modelStatus.textContent = "Face detector ready.";
   } catch (err) {
@@ -186,10 +191,10 @@ async function loadDetector() {
 // (modules/objdetect/src/face_detect.cpp): BGR float input at native scale,
 // per-stride grids where score = sqrt(cls * obj), box center = (cell +
 // offset) * stride, size = exp(regression) * stride, then greedy IoU NMS.
-async function detectYuNet(source, scratch) {
+async function detectYuNet(source, scratch, maxSide) {
   const sw = source.width;
   const sh = source.height;
-  const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(sw, sh));
+  const scale = Math.min(1, maxSide / Math.max(sw, sh));
   const dw0 = Math.max(1, Math.round(sw * scale));
   const dh0 = Math.max(1, Math.round(sh * scale));
   const dw = Math.ceil(dw0 / 32) * 32;
@@ -267,7 +272,7 @@ async function detectYuNet(source, scratch) {
 async function detectFaces(s) {
   const found = [];
   try {
-    const dets = await detectYuNet(s.frameCanvas, s);
+    const dets = await detectYuNet(s.frameCanvas, s, DETECT_SIDES[s.detectSideIdx]);
     for (const box of dets) {
       const areaFrac = (box.width * box.height) / (canvas.width * canvas.height);
       if (areaFrac > HUGE_BOX_AREA && box.score < HUGE_BOX_MIN_SCORE) continue;
@@ -492,6 +497,7 @@ async function startProcessing() {
     active: true,
     faceFrames: 0,
     detectMs: 0,
+    detectSideIdx: 0,
     tracks: [],
     chunks: [],
     recorder: null,
@@ -533,8 +539,16 @@ async function startProcessing() {
         setTimeout(resolve, 3000);
       });
     }
+    // Run a few passes on the opening frame: single-pass recall on small
+    // faces is imperfect, and this frame doubles as the video's poster.
     s.frameCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    mergeTracks(s, await detectFaces(s), performance.now());
+    for (let pass = 0; pass < 3; pass++) {
+      const before = s.tracks.length;
+      mergeTracks(s, await detectFaces(s), performance.now());
+      s.faceFrames += Math.max(0, s.tracks.length - before);
+      if (pass > 0 && s.tracks.length === before) break; // stable
+    }
+    for (const t of s.tracks) t.lastSeen = performance.now(); // don't age out during setup
     renderFrame(s);
 
     // --- audio: route the element's sound into the recording (not speakers)
@@ -628,6 +642,14 @@ async function detectionLoop(s) {
     if (!s.active) return;
     const dur = performance.now() - when;
     s.detectMs = s.detectMs ? 0.7 * s.detectMs + 0.3 * dur : dur;
+    // Trade detection resolution against pace to fit this device.
+    if (s.detectMs > DETECT_SLOW_MS && s.detectSideIdx < DETECT_SIDES.length - 1) {
+      s.detectSideIdx++;
+      s.detectMs = 0; // re-measure at the new size
+    } else if (s.detectMs && s.detectMs < DETECT_FAST_MS && s.detectSideIdx > 0) {
+      s.detectSideIdx--;
+      s.detectMs = 0;
+    }
     mergeTracks(s, found, when);
     s.faceFrames += found.length;
     // Let render callbacks breathe even when inference is very fast.
