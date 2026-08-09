@@ -23,8 +23,15 @@ const MAX_DIMENSION = 1920;                // cap output resolution for sanity
 const DETECT_MAX_SIDE = 960;
 const DETECT_SCORE = 0.6;   // minimum detection confidence
 const NMS_IOU = 0.3;        // overlap threshold for non-max suppression
-const TRACK_TTL = 12;       // frames a tracked face survives without re-detection
 const MATCH_IOU = 0.25;     // overlap needed to treat a detection as the same face
+
+// Rendering runs at full video frame rate; detection runs in parallel at
+// whatever pace the device manages. Between detections, tracked boxes are
+// advanced along their measured velocity and slightly inflated with age so
+// the blur stays on a moving face.
+const TRACK_KEEP_MS = 900;      // drop a track not re-detected for this long
+const MAX_EXTRAPOLATE_S = 0.4;  // cap on motion extrapolation
+const STALE_GROW = 0.5;         // extra box growth per second of staleness
 
 // A "face" covering a huge chunk of the frame at modest confidence is a
 // hallucination (a real close-up face scores high, so those still pass).
@@ -283,11 +290,9 @@ function iou(a, b) {
   return inter / (a.width * a.height + b.width * b.height - inter);
 }
 
-// Merge fresh detections into tracked faces. A track keeps its face blurred
-// across brief detection dropouts and expires after TRACK_TTL processed
-// frames without a matching detection.
-function mergeTracks(s, boxes) {
-  for (const t of s.tracks) t.ttl--;
+// Merge fresh detections into tracked faces, measuring per-track velocity
+// so the render loop can extrapolate positions between detections.
+function mergeTracks(s, boxes, when) {
   for (const box of boxes) {
     let best = null;
     let bestIou = MATCH_IOU;
@@ -299,13 +304,31 @@ function mergeTracks(s, boxes) {
       }
     }
     if (best) {
+      const dt = (when - best.lastSeen) / 1000;
+      if (dt > 0.005) {
+        const vx = (box.originX - best.box.originX) / dt;
+        const vy = (box.originY - best.box.originY) / dt;
+        best.vx = 0.5 * best.vx + 0.5 * vx;
+        best.vy = 0.5 * best.vy + 0.5 * vy;
+      }
       best.box = box;
-      best.ttl = TRACK_TTL;
+      best.lastSeen = when;
     } else {
-      s.tracks.push({ box, ttl: TRACK_TTL });
+      s.tracks.push({ box, vx: 0, vy: 0, lastSeen: when });
     }
   }
-  s.tracks = s.tracks.filter((t) => t.ttl > 0);
+}
+
+// Where a track's blur should be drawn right now: last detected box, moved
+// along its velocity and grown a little the longer it hasn't been confirmed.
+function predictBox(t, now) {
+  const age = Math.min((now - t.lastSeen) / 1000, MAX_EXTRAPOLATE_S);
+  const grow = 1 + STALE_GROW * age;
+  const w = t.box.width * grow;
+  const h = t.box.height * grow;
+  const cx = t.box.originX + t.box.width / 2 + t.vx * age;
+  const cy = t.box.originY + t.box.height / 2 + t.vy * age;
+  return { originX: cx - w / 2, originY: cy - h / 2, width: w, height: h };
 }
 
 // ------------------------------------------------------------------
@@ -468,6 +491,7 @@ async function startProcessing() {
     video,
     active: true,
     faceFrames: 0,
+    detectMs: 0,
     tracks: [],
     chunks: [],
     recorder: null,
@@ -501,15 +525,17 @@ async function startProcessing() {
     s.frameCanvas.height = canvas.height;
     s.frameCtx = s.frameCanvas.getContext("2d");
 
-    // Process the first frame (detect + blur) BEFORE recording starts, so
-    // not even one unblurred frame can slip into the output.
+    // Detect + render the first frame BEFORE recording starts, so not even
+    // one unblurred frame can slip into the output.
     if (video.readyState < 2) {
       await new Promise((resolve) => {
         video.oncanplay = resolve;
         setTimeout(resolve, 3000);
       });
     }
-    await processFrame(s);
+    s.frameCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    mergeTracks(s, await detectFaces(s), performance.now());
+    renderFrame(s);
 
     // --- audio: route the element's sound into the recording (not speakers)
     const stream = canvas.captureStream(30);
@@ -527,7 +553,7 @@ async function startProcessing() {
 
     s.recorder = new MediaRecorder(stream, {
       mimeType,
-      videoBitsPerSecond: 8_000_000,
+      videoBitsPerSecond: 12_000_000,
     });
     s.recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) s.chunks.push(e.data);
@@ -542,10 +568,10 @@ async function startProcessing() {
     s.recorder.start(1000);
     await video.play();
 
-    // --- per-frame loop (detection is async; never overlap runs)
-    const onFrame = async () => {
+    // --- render loop: every video frame, at full rate (cheap draws only)
+    const onFrame = () => {
       if (!s.active) return;
-      await processFrame(s);
+      renderFrame(s);
       scheduleFrame();
     };
     const scheduleFrame = () => {
@@ -554,6 +580,9 @@ async function startProcessing() {
       else requestAnimationFrame(onFrame);
     };
     scheduleFrame();
+
+    // --- detection loop: runs in parallel at its own pace
+    detectionLoop(s);
 
     await new Promise((resolve) => {
       video.onended = resolve;
@@ -576,25 +605,34 @@ async function startProcessing() {
   }
 }
 
-async function processFrame(s) {
-  const video = s.video;
-
-  // 1. snapshot a clean frame at output size — detection and blur both read
-  // from this, so boxes are already in canvas coordinates
-  s.frameCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  // 2. detect and fold into tracked faces
-  const found = await detectFaces(s);
-  if (!s.active && s.recorder) return; // cancelled mid-inference
-  mergeTracks(s, found);
-  s.faceFrames += found.length;
-
-  // 3. draw + blur every tracked face
+// Draw the current video frame with blurs at the tracks' predicted
+// positions. Runs at full video frame rate; must stay cheap.
+function renderFrame(s) {
+  const now = performance.now();
+  s.frameCtx.drawImage(s.video, 0, 0, canvas.width, canvas.height);
+  // On slow devices a single detection pass can take a while; never expire
+  // tracks faster than the detector can re-confirm them.
+  const keepMs = Math.max(TRACK_KEEP_MS, (s.detectMs || 0) * 3);
+  s.tracks = s.tracks.filter((t) => now - t.lastSeen < keepMs);
   ctx.drawImage(s.frameCanvas, 0, 0);
-  for (const t of s.tracks) blurRegion(s, t.box);
+  for (const t of s.tracks) blurRegion(s, predictBox(t, now));
+  updateProgress(s.video.currentTime, s.duration, s.faceFrames);
+}
 
-  // 4. progress
-  updateProgress(video.currentTime, s.duration, s.faceFrames);
+// Detect continuously while processing is active. Each pass reads whatever
+// frame the render loop most recently copied into frameCanvas.
+async function detectionLoop(s) {
+  while (s.active) {
+    const when = performance.now();
+    const found = await detectFaces(s);
+    if (!s.active) return;
+    const dur = performance.now() - when;
+    s.detectMs = s.detectMs ? 0.7 * s.detectMs + 0.3 * dur : dur;
+    mergeTracks(s, found, when);
+    s.faceFrames += found.length;
+    // Let render callbacks breathe even when inference is very fast.
+    await new Promise((r) => setTimeout(r, 15));
+  }
 }
 
 function updateProgress(current, duration, faceFrames = 0) {
