@@ -4,6 +4,31 @@
 // third-party requests. Face detection is YuNet (opencv_zoo, MIT) running on
 // ONNX Runtime Web's WASM engine, entirely inside a worker (detect-worker.js)
 // so the main thread — which draws and records every frame — never blocks.
+//
+// Two processing modes:
+//  - Precise (default, needs WebCodecs): every source frame is decoded,
+//    scanned, blurred, and re-encoded with its exact timestamp via
+//    Mediabunny. Slower than the video, but frame-perfect: full source
+//    frame rate, and the blur is measured on the very frame it covers.
+//  - Realtime (fallback): the video plays into a canvas that is recorded
+//    with MediaRecorder while detection tracks faces in parallel.
+import {
+  Input,
+  BlobSource,
+  ALL_FORMATS,
+  Output,
+  BufferTarget,
+  Mp4OutputFormat,
+  VideoSampleSink,
+  CanvasSource,
+  AudioSampleSink,
+  AudioSampleSource,
+  EncodedPacketSink,
+  EncodedAudioPacketSource,
+  getFirstEncodableVideoCodec,
+  getFirstEncodableAudioCodec,
+  QUALITY_HIGH,
+} from "./vendor/mediabunny/mediabunny.min.mjs";
 
 // ------------------------------------------------------------------
 // Config
@@ -42,6 +67,16 @@ const STALE_GROW = 0.5;         // extra box growth per second of staleness
 // hallucination (a real close-up face scores high, so those still pass).
 const HUGE_BOX_AREA = 0.35;
 const HUGE_BOX_MIN_SCORE = 0.8;
+
+// Precise mode: with detection running on every single frame, a lost face
+// only needs a short linger (in frames) to bridge detector blinks.
+const OFFLINE_LINGER_FRAMES = 3;
+// A face can move far between frames, dropping box overlap to zero, so
+// detections are matched against each track's velocity-predicted position
+// and accepted when the centre lands within this multiple of the box size.
+// Too small and fast motion spawns duplicate tracks that linger as ghost
+// blurs trailing the real face.
+const MATCH_CENTRE_DIST = 2.0;
 
 // How much to expand the detected face box before blurring.
 const COVERAGE_PADDING = { snug: 0.0, normal: 0.1, extra: 0.3 };
@@ -271,6 +306,82 @@ function mergeTracks(s, boxes, when) {
   }
 }
 
+// Precise-mode tracker: detection runs on every frame, so tracking is just
+// "blur what was found, and let a lost face linger a few frames, slightly
+// grown, to bridge detector blinks".
+function offlineMerge(s, boxes) {
+  for (const t of s.tracks) {
+    t.missed = (t.missed ?? 0) + 1;
+    // Where this face should be now, given how it was moving.
+    t.predicted = shiftBox(t.box, t.vx * t.missed, t.vy * t.missed);
+  }
+  for (const box of boxes) {
+    let best = null;
+    let bestScore = 0;
+    for (const t of s.tracks) {
+      if (t.claimed) continue;
+      const score = matchScore(t.predicted, box);
+      if (score > bestScore) {
+        best = t;
+        bestScore = score;
+      }
+    }
+    if (best) {
+      const frames = best.missed;
+      best.vx = 0.6 * best.vx + 0.4 * (box.originX - best.box.originX) / frames;
+      best.vy = 0.6 * best.vy + 0.4 * (box.originY - best.box.originY) / frames;
+      best.claimed = true;
+      best.box = box;
+      best.missed = 0;
+    } else {
+      // claimed so a second detection in this same frame can't match it,
+      // and predicted so it is a complete track if that comparison happens
+      s.tracks.push({ box, predicted: box, vx: 0, vy: 0, missed: 0, claimed: true });
+    }
+  }
+  for (const t of s.tracks) t.claimed = false;
+  s.tracks = s.tracks.filter((t) => t.missed <= OFFLINE_LINGER_FRAMES);
+}
+
+function shiftBox(b, dx, dy) {
+  return { originX: b.originX + dx, originY: b.originY + dy, width: b.width, height: b.height };
+}
+
+// How strongly two boxes look like the same face: overlap, or failing that,
+// proximity of their centres relative to their size (which survives the
+// large jumps a fast-moving face makes between frames).
+function matchScore(a, b) {
+  const overlap = iou(a, b);
+  if (overlap > MATCH_IOU) return 1 + overlap;
+  const ax = a.originX + a.width / 2;
+  const ay = a.originY + a.height / 2;
+  const bx = b.originX + b.width / 2;
+  const by = b.originY + b.height / 2;
+  const size = (a.width + a.height + b.width + b.height) / 4;
+  if (size <= 0) return 0;
+  const dist = Math.hypot(ax - bx, ay - by) / size;
+  // Similar sizes too — a distant face shouldn't absorb a near one.
+  const ratio = Math.min(a.width / b.width, b.width / a.width);
+  if (dist > MATCH_CENTRE_DIST || ratio < 0.5) return 0;
+  return 1 - dist / MATCH_CENTRE_DIST;
+}
+
+// While a face is briefly un-detected, keep its blur moving along the path
+// it was travelling and grow it a little to stay covered.
+function offlineBox(t) {
+  if (!t.missed) return t.box;
+  const moved = shiftBox(t.box, t.vx * t.missed, t.vy * t.missed);
+  const grow = 1 + 0.15 * t.missed;
+  const w = moved.width * grow;
+  const h = moved.height * grow;
+  return {
+    originX: moved.originX + moved.width / 2 - w / 2,
+    originY: moved.originY + moved.height / 2 - h / 2,
+    width: w,
+    height: h,
+  };
+}
+
 // Where a track's blur should be drawn right now: last detected box, moved
 // along its velocity and grown a little the longer it hasn't been confirmed.
 function predictBox(t, now) {
@@ -426,29 +537,13 @@ async function startProcessing() {
     return;
   }
 
-  const mimeType = pickMimeType();
-  if (!mimeType) {
-    showUploadError(
-      "This browser can't record video (MediaRecorder missing). Use a recent Chrome, Edge, Firefox, or Safari."
-    );
-    return;
-  }
-
   clearUploadError();
 
   const coverage = $("coverage-select").value;
   boxPadding = COVERAGE_PADDING[coverage] ?? COVERAGE_PADDING.normal;
 
-  // Fresh hidden <video> per run (a MediaElementSource can only ever be
-  // attached to an element once).
-  const video = document.createElement("video");
-  video.playsInline = true;
-  video.preload = "auto";
-  video.crossOrigin = "anonymous";
-  video.src = currentObjectUrl;
-
   session = {
-    video,
+    video: null,
     active: true,
     faceFrames: 0,
     detectMs: 0,
@@ -457,11 +552,210 @@ async function startProcessing() {
     chunks: [],
     recorder: null,
     audioCtx: null,
-    mimeType,
+    mimeType: null,
+    startedAt: performance.now(),
     frameCanvas: document.createElement("canvas"),
     tinyCanvas: document.createElement("canvas"),
   };
   const s = session;
+
+  // Precise mode: frame-exact processing via WebCodecs. Falls back to the
+  // realtime pipeline when the browser or the file can't do it.
+  if (typeof VideoDecoder !== "undefined" && typeof VideoEncoder !== "undefined") {
+    try {
+      document.body.dataset.mode = "precise";
+      await processPrecise(s);
+      return;
+    } catch (err) {
+      if (!s.active) return; // cancelled mid-run
+      console.warn("Precise mode unavailable, using realtime fallback:", err);
+      document.body.dataset.mode = "realtime";
+      s.tracks = [];
+      s.faceFrames = 0;
+      s.detectSideIdx = 0;
+      s.startedAt = performance.now();
+    }
+  }
+  await processRealtime(s);
+}
+
+// ------------------------------------------------------------------
+// Precise mode: decode every source frame, scan it, blur it, re-encode it
+// with its original timestamp, and copy the audio track untouched.
+// ------------------------------------------------------------------
+
+async function processPrecise(s) {
+  const input = new Input({ source: new BlobSource(currentFile), formats: ALL_FORMATS });
+  try {
+    const vTrack = await input.getPrimaryVideoTrack();
+    if (!vTrack) throw new Error("no video track");
+    if (!(await vTrack.canDecode())) throw new Error("codec not decodable via WebCodecs");
+    const duration = await input.computeDuration();
+    s.duration = duration;
+
+    // Size the canvas (cap the longest side to keep memory + encoder happy;
+    // even dimensions keep H.264 encoders happy).
+    let w = vTrack.displayWidth;
+    let h = vTrack.displayHeight;
+    const longest = Math.max(w, h);
+    if (longest > MAX_DIMENSION) {
+      const scale = MAX_DIMENSION / longest;
+      w = Math.round(w * scale);
+      h = Math.round(h * scale);
+    }
+    canvas.width = w - (w % 2);
+    canvas.height = h - (h % 2);
+    s.frameCanvas.width = canvas.width;
+    s.frameCanvas.height = canvas.height;
+    s.frameCtx = s.frameCanvas.getContext("2d");
+
+    const outputFormat = new Mp4OutputFormat({ fastStart: "in-memory" });
+    const videoCodec = await getFirstEncodableVideoCodec(
+      ["avc", "hevc", "vp9", "av1"].filter((c) => outputFormat.getSupportedCodecs().includes(c)),
+      { width: canvas.width, height: canvas.height }
+    );
+    if (!videoCodec) throw new Error("no encodable MP4 video codec");
+
+    const output = new Output({ format: outputFormat, target: new BufferTarget() });
+    const videoSource = new CanvasSource(canvas, { codec: videoCodec, quality: QUALITY_HIGH });
+    output.addVideoTrack(videoSource);
+
+    // Audio: copy the original packets untouched when MP4 can hold them;
+    // otherwise re-encode; otherwise ship without audio and say so.
+    let audio = null;
+    s.audioDropped = false;
+    const aTrack = await input.getPrimaryAudioTrack();
+    if (aTrack) {
+      if (aTrack.codec && outputFormat.getSupportedCodecs().includes(aTrack.codec)) {
+        const src = new EncodedAudioPacketSource(aTrack.codec);
+        output.addAudioTrack(src);
+        audio = {
+          kind: "copy",
+          src,
+          iter: new EncodedPacketSink(aTrack).packets(),
+          meta: { decoderConfig: await aTrack.getDecoderConfig() },
+          pending: null,
+          done: false,
+        };
+      } else if (await aTrack.canDecode()) {
+        const aCodec = await getFirstEncodableAudioCodec(
+          ["aac", "opus"].filter((c) => outputFormat.getSupportedCodecs().includes(c)),
+          { numberOfChannels: aTrack.numberOfChannels, sampleRate: aTrack.sampleRate }
+        );
+        if (aCodec) {
+          const src = new AudioSampleSource({ codec: aCodec, quality: QUALITY_HIGH });
+          output.addAudioTrack(src);
+          audio = {
+            kind: "samples",
+            src,
+            iter: new AudioSampleSink(aTrack).samples(),
+            pending: null,
+            done: false,
+          };
+        } else {
+          s.audioDropped = true;
+        }
+      } else {
+        s.audioDropped = true;
+      }
+    }
+
+    await output.start();
+    showScreen("processing");
+    updateProgress(0, duration, 0, s);
+
+    const vSink = new VideoSampleSink(vTrack);
+    for await (const sample of vSink.samples()) {
+      if (!s.active) {
+        sample.close();
+        await output.cancel();
+        return;
+      }
+      const ts = sample.timestamp;
+      const dur = sample.duration;
+      sample.draw(s.frameCtx, 0, 0, canvas.width, canvas.height);
+      sample.close();
+
+      // Detect on this exact frame — no prediction, no staleness.
+      const found = await detectFaces(s);
+      offlineMerge(s, found);
+      s.faceFrames += found.length;
+
+      ctx.drawImage(s.frameCanvas, 0, 0);
+      for (const t of s.tracks) blurRegion(s, offlineBox(t));
+
+      await videoSource.add(ts, dur); // built-in encoder backpressure
+      await pumpAudio(audio, ts + 1);
+      updateProgress(ts, duration, s.faceFrames, s);
+    }
+
+    if (!s.active) {
+      await output.cancel();
+      return;
+    }
+    await pumpAudio(audio, Infinity);
+    await output.finalize();
+
+    const blob = new Blob([output.target.buffer], { type: "video/mp4" });
+    finishProcessing(blob, s, { isMp4: true });
+  } finally {
+    try {
+      input.dispose();
+    } catch {}
+  }
+}
+
+// Feed audio into the muxer up to the given media timestamp, keeping the
+// file nicely interleaved as video frames are appended.
+async function pumpAudio(audio, untilTs) {
+  if (!audio || audio.done) return;
+  while (true) {
+    if (!audio.pending) {
+      const r = await audio.iter.next();
+      if (r.done) {
+        audio.done = true;
+        return;
+      }
+      audio.pending = r.value;
+    }
+    if (audio.pending.timestamp > untilTs) return;
+    const item = audio.pending;
+    audio.pending = null;
+    if (audio.kind === "copy") {
+      await audio.src.add(item, audio.meta);
+    } else {
+      await audio.src.add(item);
+      item.close();
+    }
+  }
+}
+
+// ------------------------------------------------------------------
+// Realtime fallback: play the video into the canvas and record it while
+// detection tracks faces in parallel.
+// ------------------------------------------------------------------
+
+async function processRealtime(s) {
+  document.body.dataset.mode = document.body.dataset.mode || "realtime";
+  const mimeType = pickMimeType();
+  if (!mimeType) {
+    failProcessing(
+      new Error(
+        "This browser can't process video (WebCodecs and MediaRecorder both missing). Use a recent Chrome, Edge, Firefox, or Safari."
+      )
+    );
+    return;
+  }
+  s.mimeType = mimeType;
+
+  // Fresh hidden <video> per run (a MediaElementSource can only ever be
+  // attached to an element once).
+  const video = document.createElement("video");
+  video.playsInline = true;
+  video.preload = "auto";
+  video.crossOrigin = "anonymous";
+  video.src = currentObjectUrl;
+  s.video = video;
 
   try {
     await new Promise((resolve, reject) => {
@@ -534,7 +828,7 @@ async function startProcessing() {
     const finished = new Promise((resolve) => (s.recorder.onstop = resolve));
 
     showScreen("processing");
-    updateProgress(0, s.duration);
+    updateProgress(0, s.duration, 0, s);
 
     s.recorder.start(1000);
     await video.play();
@@ -566,7 +860,7 @@ async function startProcessing() {
     await finished;
 
     const blob = new Blob(s.chunks, { type: mimeType.split(";")[0] });
-    finishProcessing(blob, s);
+    finishProcessing(blob, s, { isMp4: mimeType.startsWith("video/mp4") });
   } catch (err) {
     failProcessing(err);
   } finally {
@@ -587,7 +881,7 @@ function renderFrame(s) {
   s.tracks = s.tracks.filter((t) => now - t.lastSeen < keepMs);
   ctx.drawImage(s.frameCanvas, 0, 0);
   for (const t of s.tracks) blurRegion(s, predictBox(t, now));
-  updateProgress(s.video.currentTime, s.duration, s.faceFrames);
+  updateProgress(s.video.currentTime, s.duration, s.faceFrames, s);
 }
 
 // Detect continuously while processing is active. Each pass reads whatever
@@ -614,7 +908,7 @@ async function detectionLoop(s) {
   }
 }
 
-function updateProgress(current, duration, faceFrames = 0) {
+function updateProgress(current, duration, faceFrames = 0, s = null) {
   const pct = duration > 0 && isFinite(duration)
     ? Math.min(100, Math.round((current / duration) * 100))
     : 0;
@@ -622,14 +916,18 @@ function updateProgress(current, duration, faceFrames = 0) {
   $("progress-label").textContent = pct + "%";
   $("progress-bar").setAttribute("aria-valuenow", String(pct));
   $("stat-faces").textContent = String(faceFrames);
-  $("stat-time").textContent = `${formatTime(current)} / ${formatTime(duration)}`;
+  let time = `${formatTime(current)} / ${formatTime(duration)}`;
+  if (s && s.startedAt && pct >= 3 && pct < 100) {
+    const elapsed = (performance.now() - s.startedAt) / 1000;
+    time += ` · about ${formatTime((elapsed * (100 - pct)) / pct)} left`;
+  }
+  $("stat-time").textContent = time;
 }
 
-function finishProcessing(blob, s) {
+function finishProcessing(blob, s, { isMp4 }) {
   if (resultUrl) URL.revokeObjectURL(resultUrl);
   resultUrl = URL.createObjectURL(blob);
 
-  const isMp4 = s.mimeType.startsWith("video/mp4");
   const ext = isMp4 ? "mp4" : "webm";
   const baseName = (currentFile?.name || "video").replace(/\.[^.]+$/, "");
 
@@ -638,6 +936,7 @@ function finishProcessing(blob, s) {
   $("final-size").textContent = formatBytes(blob.size);
   $("no-faces-note").hidden = s.faceFrames > 0;
   $("webm-note").hidden = isMp4;
+  $("audio-note").hidden = !s.audioDropped;
 
   const link = $("download-link");
   link.href = resultUrl;

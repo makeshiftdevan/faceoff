@@ -1,9 +1,15 @@
-Vendored third-party components (all MIT licensed):
+Vendored third-party components:
 
 vendor/ort/
   ONNX Runtime Web 1.27.0 — Copyright (c) Microsoft Corporation. MIT License.
   https://www.npmjs.com/package/onnxruntime-web
   Files: ort.wasm.bundle.min.mjs, ort-wasm-simd-threaded.mjs, ort-wasm-simd-threaded.wasm
+
+vendor/mediabunny/
+  Mediabunny 1.53.1 — Copyright (c) Vanilagy. MPL-2.0 (see LICENSE).
+  https://mediabunny.dev/
+  Used unmodified for MP4 demuxing/muxing in the precise processing mode.
+  File: mediabunny.min.mjs
 
 vendor/98css/
   98.css 0.1.21 — Copyright (c) 2020 Jordan Scales. MIT License (see LICENSE).

@@ -80,7 +80,7 @@
         </div>
         <p class="progress-stats"><span id="progress-label">0%</span> · Faces found: <span id="stat-faces">0</span> · <span id="stat-time">0:00 / 0:00</span></p>
 
-        <p class="hint">Keep this tab open. Processing takes about as long as the video.</p>
+        <p class="hint">Keep this tab open. Every frame is scanned, so this takes longer than the video itself.</p>
         <div class="action-row">
           <button type="button" id="cancel-btn">Cancel</button>
         </div>
@@ -98,6 +98,11 @@
         <div id="webm-note" class="msg-box msg-warn" hidden>
           <span class="msg-icon" aria-hidden="true">ℹ️</span>
           <span>This browser can't write MP4, so the file is WebM. For MP4, use Chrome, Edge, or Safari.</span>
+        </div>
+
+        <div id="audio-note" class="msg-box msg-warn" hidden>
+          <span class="msg-icon" aria-hidden="true">ℹ️</span>
+          <span>The original audio format couldn't be carried over, so this file has no sound.</span>
         </div>
 
         <div class="video-panel">
