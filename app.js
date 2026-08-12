@@ -2,8 +2,8 @@
 
 // Everything is vendored locally (see vendor/NOTICE.txt) — the app makes zero
 // third-party requests. Face detection is YuNet (opencv_zoo, MIT) running on
-// ONNX Runtime Web's WASM engine.
-import * as ort from "./vendor/ort/ort.wasm.bundle.min.mjs";
+// ONNX Runtime Web's WASM engine, entirely inside a worker (detect-worker.js)
+// so the main thread — which draws and records every frame — never blocks.
 
 // ------------------------------------------------------------------
 // Config
@@ -86,8 +86,10 @@ const ctx = canvas.getContext("2d");
 // State
 // ------------------------------------------------------------------
 
-let yunet = null; // ORT InferenceSession
+let detectWorker = null;
 let detectorReady = false;
+let detectReqId = 0;
+const detectPending = new Map();
 let currentFile = null;
 let currentObjectUrl = null;
 let resultUrl = null;
@@ -164,115 +166,60 @@ const useCanvasBlur = canvasFilterSupported();
 // Face detector: YuNet on ONNX Runtime Web (WASM, runs locally)
 // ------------------------------------------------------------------
 
-async function loadDetector() {
+function loadDetector() {
   try {
-    yunet = await ort.InferenceSession.create("./assets/face_detection_yunet_2026may.onnx", {
-      executionProviders: ["wasm"],
+    detectWorker = new Worker(new URL("detect-worker.js", document.baseURI), { type: "module" });
+    detectWorker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === "ready") {
+        detectorReady = true;
+        modelStatus.textContent = "Face detector ready.";
+        return;
+      }
+      const req = detectPending.get(msg.id);
+      if (!req) return;
+      detectPending.delete(msg.id);
+      if (msg.type === "result") req.resolve(msg.boxes);
+      else req.reject(new Error(msg.message || "Detection failed."));
+    };
+    detectWorker.onerror = (e) => {
+      console.error("Detector worker failed:", e.message || e);
+      if (!detectorReady) {
+        modelStatus.textContent = "Could not load the face detector. Refresh the page to retry.";
+      }
+    };
+    detectWorker.postMessage({
+      type: "init",
+      wasmPaths: new URL("vendor/ort/", document.baseURI).href,
+      modelUrl: new URL("assets/face_detection_yunet_2026may.onnx", document.baseURI).href,
     });
-    // Warm up so the first real frame doesn't pay the compile cost.
-    const warm = document.createElement("canvas");
-    warm.width = 96;
-    warm.height = 96;
-    warm.getContext("2d").fillRect(0, 0, 96, 96);
-    await detectYuNet(warm, {}, 96);
-    detectorReady = true;
-    modelStatus.textContent = "Face detector ready.";
   } catch (err) {
     console.error("Detector load failed:", err);
-    modelStatus.textContent =
-      "Could not load the face detector. Refresh the page to retry.";
+    modelStatus.textContent = "Could not load the face detector. Refresh the page to retry.";
   }
 }
 
-// Run YuNet on a canvas. Returns boxes in the source canvas's coordinates:
-// { originX, originY, width, height, score }.
-//
-// Pre/post-processing follows OpenCV's FaceDetectorYN
-// (modules/objdetect/src/face_detect.cpp): BGR float input at native scale,
-// per-stride grids where score = sqrt(cls * obj), box center = (cell +
-// offset) * stride, size = exp(regression) * stride, then greedy IoU NMS.
-async function detectYuNet(source, scratch, maxSide) {
-  const sw = source.width;
-  const sh = source.height;
-  const scale = Math.min(1, maxSide / Math.max(sw, sh));
-  const dw0 = Math.max(1, Math.round(sw * scale));
-  const dh0 = Math.max(1, Math.round(sh * scale));
-  const dw = Math.ceil(dw0 / 32) * 32;
-  const dh = Math.ceil(dh0 / 32) * 32;
-
-  if (!scratch.detectCanvas) scratch.detectCanvas = document.createElement("canvas");
-  const dc = scratch.detectCanvas;
-  if (dc.width !== dw || dc.height !== dh) {
-    dc.width = dw;
-    dc.height = dh;
-  }
-  const dctx = dc.getContext("2d", { willReadFrequently: true });
-  dctx.fillStyle = "#000";
-  dctx.fillRect(0, 0, dw, dh);
-  dctx.drawImage(source, 0, 0, sw, sh, 0, 0, dw0, dh0);
-
-  const rgba = dctx.getImageData(0, 0, dw, dh).data;
-  const n = dw * dh;
-  const input = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {
-    input[i] = rgba[i * 4 + 2];         // B
-    input[n + i] = rgba[i * 4 + 1];     // G
-    input[2 * n + i] = rgba[i * 4];     // R
-  }
-  const feeds = {};
-  feeds[yunet.inputNames[0]] = new ort.Tensor("float32", input, [1, 3, dh, dw]);
-  const out = await yunet.run(feeds);
-
-  const candidates = [];
-  for (const stride of [8, 16, 32]) {
-    const cls = out["cls_" + stride].data;
-    const obj = out["obj_" + stride].data;
-    const bbox = out["bbox_" + stride].data;
-    const rows = dh / stride;
-    const cols = dw / stride;
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const idx = r * cols + c;
-        const clsScore = Math.min(1, Math.max(0, cls[idx]));
-        const objScore = Math.min(1, Math.max(0, obj[idx]));
-        const score = Math.sqrt(clsScore * objScore);
-        if (score < DETECT_SCORE) continue;
-        const cx = (c + bbox[idx * 4]) * stride;
-        const cy = (r + bbox[idx * 4 + 1]) * stride;
-        const w = Math.exp(bbox[idx * 4 + 2]) * stride;
-        const h = Math.exp(bbox[idx * 4 + 3]) * stride;
-        candidates.push({
-          score,
-          originX: cx - w / 2,
-          originY: cy - h / 2,
-          width: w,
-          height: h,
-        });
-      }
-    }
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  const kept = [];
-  for (const box of candidates) {
-    if (kept.length >= 100) break;
-    if (kept.every((k) => iou(k, box) <= NMS_IOU)) kept.push(box);
-  }
-
-  const back = 1 / (dw0 / sw); // undo the downscale
-  return kept.map((b) => ({
-    score: b.score,
-    originX: b.originX * back,
-    originY: b.originY * back,
-    width: b.width * back,
-    height: b.height * back,
-  }));
-}
-
+// Hand the current frame to the worker (zero-copy bitmap transfer) and get
+// back boxes in canvas coordinates.
 async function detectFaces(s) {
   const found = [];
   try {
-    const dets = await detectYuNet(s.frameCanvas, s, DETECT_SIDES[s.detectSideIdx]);
+    const bitmap = await createImageBitmap(s.frameCanvas);
+    const dets = await new Promise((resolve, reject) => {
+      const id = ++detectReqId;
+      detectPending.set(id, { resolve, reject });
+      detectWorker.postMessage(
+        {
+          type: "detect",
+          id,
+          bitmap,
+          maxSide: DETECT_SIDES[s.detectSideIdx],
+          score: DETECT_SCORE,
+          nmsIou: NMS_IOU,
+        },
+        [bitmap]
+      );
+    });
     for (const box of dets) {
       const areaFrac = (box.width * box.height) / (canvas.width * canvas.height);
       if (areaFrac > HUGE_BOX_AREA && box.score < HUGE_BOX_MIN_SCORE) continue;
@@ -442,8 +389,16 @@ function blurRegion(s, box) {
 
   if (useCanvasBlur) {
     const radius = Math.max(10, Math.round(w / 8));
+    // Draw only the patch around the face (padded by 2x the blur radius so
+    // the kernel's edge falloff never reaches the visible ellipse) instead
+    // of pushing the whole frame through the filter for every face.
+    const m = radius * 2;
+    const px = Math.max(0, x - m);
+    const py = Math.max(0, y - m);
+    const pw = Math.min(canvas.width, x + w + m) - px;
+    const ph = Math.min(canvas.height, y + h + m) - py;
     ctx.filter = `blur(${radius}px)`;
-    ctx.drawImage(s.frameCanvas, 0, 0);
+    ctx.drawImage(s.frameCanvas, px, py, pw, ph, px, py, pw, ph);
     ctx.filter = "none";
   } else {
     // Fallback for browsers without canvas filters: chunky pixelation.
@@ -552,7 +507,9 @@ async function startProcessing() {
     renderFrame(s);
 
     // --- audio: route the element's sound into the recording (not speakers)
-    const stream = canvas.captureStream(30);
+    // No frame-rate argument: capture every canvas paint, so 60 fps sources
+    // record at 60 fps when the device keeps up.
+    const stream = canvas.captureStream();
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       s.audioCtx = new AudioCtx();
